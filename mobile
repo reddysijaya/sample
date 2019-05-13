@@ -1,0 +1,139 @@
+@Override
+	@Transactional(propagation = Propagation.REQUIRED) 
+	public Map<String, Object> order(String sidNo, String productCode, String amount, String kodeRefferal, String accountNo) throws Exception { // Interface-Pemesanan.Order Transaction
+		log.debug("order sidNo="+sidNo+", productCode="+productCode+", amount="+amount+", kodeRefferal="+kodeRefferal+", accountNo="+accountNo);
+
+		if(kodeRefferal.isEmpty()) throw new MedallionException("Refferal Code is empty.");
+		String menu = MenuConstant.MENU_FI_IPO_TRANSACTION_ENTRY;
+		GnSystemParam sysParam = systemService.getSystemParameterCache(SystemParamConstant.SCHEDULER_USER_USERID);
+		String schedulerUserId = sysParam.getValue();
+		GnUser operator = userRepo.findByUserId(schedulerUserId);
+
+		Date appDate = systemService.getCurrentBusinessDate();
+		GnBranch branch = branchRepo.getDefaultBranchEChannel();
+		CfMaster customer = cfMasterRepo.findBySidNoMobile(sidNo);
+		SaProduct product = productRepo.findByProductCode(productCode);
+		CfPrdAccount prdAccount = productAccountRepo.findByCustomerAndProduct(customer.getCustomerKey(), product.getProductKey());
+		if(prdAccount == null) {
+			prdAccount = new CfPrdAccount();
+			prdAccount.setRegDate(appDate);
+			prdAccount.setProduct(product);
+			prdAccount.setCurrencyDesc(product.getCurrency().getCode());
+			prdAccount.setLocked(false);
+			prdAccount.setEnabled(true);
+			prdAccount.setBranch(branch);
+			prdAccount.setAccountType(new GnLookup(LookupConstants.PRODUCT_ACCT_TYPE_INVESTOR));
+			prdAccount.setSecAccActive(false);
+			prdAccount.setSubBranch(branch.getSubBranchDefault());
+			prdAccount.setCustomer(customer);
+			prdAccount.setBankAccount(customer.getCustBankAccountDefault());
+
+			String secAccNo = null;
+			String subRegCode = null;
+			List<CfPrdAccount> cfPrdAccounts = productAccountRepo.listPrdAccountByCfMaster(customer.getCustomerKey());
+			for (CfPrdAccount prdAccountDb : cfPrdAccounts) {
+				if (LookupConstants.PRODUCT_CATEGORY_SECURITY.equals(prdAccountDb.getProduct().getProductCategory().getLookupId())
+						&& prdAccountDb.getSecAccNo() != null
+						&& prdAccountDb.getSubRegistryCode() != null){
+					secAccNo = prdAccountDb.getSecAccNo();
+					subRegCode = prdAccountDb.getSubRegistryCode();
+					break;
+				}
+			}
+
+			prdAccount.setSecAccNo(secAccNo);
+			prdAccount.setSubRegistryCode(subRegCode);
+			prdAccount.setSecAccActive(true);
+
+			TransactionObject toCfPrdAccount = customerService.saveProductAccount(prdAccount, operator, MenuConstant.MENU_CF_PRODUCT_ACCOUNT);
+			prdAccount = customerService.approvalProductAccount(toCfPrdAccount.getWorkflow().getWorkflowKey(), operator, MenuConstant.MENU_CF_PRODUCT_ACCOUNT, action, remark);
+			registerInvestorOrder(customer, product);
+		}
+
+		CfPrdSubAccount prdSubAccount = productSubAccountRepo.findByPrdAcctKey(prdAccount.getProductAccountKey());
+		SaSales sales = salesRepo.findBySalesCode(salesVirtualEChannel);
+		if(sales == null) throw new Exception("Sales not found.");
+		BnAccount account = bnAccountRepo.findByAccountNoCustomerDefaults(customer.getCustomerKey());
+		if(!accountNo.isEmpty()) account = bnAccountRepo.findByAccountNoAndCustomerKey(customer.getCustomerKey(), accountNo);
+		if(account == null) throw new MedallionException("Account No not found.");
+
+		String sysDate = DateTool.formatYMD(new Date());
+		log.debug("order sysDate => " + sysDate);
+		GnCalendar calendar = calendarRepo.findHolidayDate(sysDate);
+		if(calendar != null) throw new MedallionException(sysDate + " is holiday");
+
+		ScOrder o = populateScOrderMobile(appDate, customer, product, branch, sales, prdAccount, prdSubAccount, accountNo, new BigDecimal(amount), kodeRefferal);
+		DispatchModel dm = new DispatchModel();
+		dm.setScOrder(o);
+		dm.setMenu(MenuConstant.MENU_FI_IPO_TRANSACTION_ENTRY);
+		dm.setMode(DispatchModel.CREATE);
+
+		TransactionObject tObject = fixIncomeService.saveSecurityOrder(dm.getScOrder(), operator, menu);
+		o = fixIncomeService.approvalSecurityOrder(tObject.getWorkflow().getWorkflowKey(), operator, menu, action, remark);
+
+		Integer idRekDana = null;
+		LinkedHashMap<String, Object> paramMapRekDana = new LinkedHashMap<String, Object>();
+		paramMapRekDana.put("IdBank", Integer.valueOf(account.getBank().getCode()));
+		paramMapRekDana.put("Sid", sidNo);
+		paramMapRekDana.put("NoRek", account.getAccountNo());
+		paramMapRekDana.put("Nama", account.getBeneficiaryName());
+		Result resultRekDana = sbnService.menambahRekeningDanaInvestor(paramMapRekDana);
+		if (resultRekDana.isSucccess() || resultRekDana.matchResponseCode(409)) {
+			RekeningDanaBean bean = (RekeningDanaBean) resultRekDana.getObject();
+			idRekDana = bean.Id;
+			if(BooleanTool.isFalse(account.getSbn())) bnAccountRepo.updateBnAccountSbn(account.getAccountKey(), true);
+		} else {
+			log.error("MenambahRekeningDanaInvestor "+resultRekDana.getErrorCode()+"  "+resultRekDana.getMessage());
+			throw new MedallionException(resultRekDana.getResponseCode()+" : "+resultRekDana.getErrorCode()+" "+resultRekDana.getMessage());
+		}
+
+		if(prdAccount.getSubRegistryCode() == null) throw new MedallionException("IdSubregistry not found.");
+		if(product.getCustodianBank().getExternal1() == null) throw new MedallionException("IdPartisipan not found.");
+		Integer idRekSB = null;
+		LinkedHashMap<String, Object> paramMapRekSB = new LinkedHashMap<String, Object>();
+		paramMapRekSB.put("IdSubregistry", Integer.valueOf(prdAccount.getSubRegistryCode()));  
+		paramMapRekSB.put("IdPartisipan", Integer.valueOf(product.getCustodianBank().getExternal1()));  
+		paramMapRekSB.put("Sid", sidNo);
+		paramMapRekSB.put("NoRek", prdAccount.getSecAccNo());
+		paramMapRekSB.put("Nama", customer.getFullName());
+		Result resultRekSB = sbnService.menambahRekeningSuratBerhargaInvestor(paramMapRekSB);
+		if (resultRekSB.isSucccess() || resultRekSB.matchResponseCode(409)) {
+			RekeningSBBean bean = (RekeningSBBean) resultRekSB.getObject();
+			idRekSB = bean.Id;
+			if(BooleanTool.isFalse(prdAccount.getSbn())) productAccountRepo.updateCfPrdAccountSbn(prdAccount.getProductAccountKey(), true);
+		} else {
+			log.error("menambahRekeningSuratBerhargaInvestor "+resultRekSB.getErrorCode()+"  "+resultRekSB.getMessage());
+			throw new MedallionException(resultRekSB.getResponseCode()+" : "+resultRekSB.getErrorCode()+" "+resultRekSB.getMessage());
+		}
+
+		Map<String, Object> result = new HashMap<String, Object>();
+		Long idSeri = getIdSeri();
+		LinkedHashMap<String, Object> userOrderBean = new LinkedHashMap<String, Object>();
+		userOrderBean.put("Sid", sidNo);
+		userOrderBean.put("IdSeri", idSeri);
+		userOrderBean.put("IdRekDana", idRekDana);
+		userOrderBean.put("IdRekSB", idRekSB);
+		userOrderBean.put("Nominal", o.getAmount());
+		Result resultBilling = sbnService.melakukanPemesananSuratBerhargaNegara(userOrderBean);
+		if (resultBilling.isSucccess() || resultBilling.matchResponseCode(409)) { // 409 sudah di daftarkan/terdaftar
+			OrderBean bean = (OrderBean) resultBilling.getObject();
+			String kodeBilling = bean.KodeBilling;
+			Date batasWaktuBayar = DateTool.parseNoErr(bean.BatasWaktuBayar, YYYYMMDDTHHMMSS);
+			Date nextBusinessDate = systemService.getNextBusinessDate();
+			Calendar cal = Calendar.getInstance();
+			cal.setTime(nextBusinessDate);
+			cal.add(Calendar.DATE, 1);
+			cal.add(Calendar.SECOND, -1);
+			Date batasWaktuExpired = cal.getTime();
+
+			result.put("trxId", o.getOrderNo());
+			result.put("kodeBilling", kodeBilling);
+			result.put("batasWaktuBayar", DateTool.format(batasWaktuBayar, "yyyyMMdd HH:mm:ss"));
+			scOrderRepo.updateScOrderKodeBillingAndBatasWaktuBayar(kodeBilling, batasWaktuBayar, batasWaktuExpired, o.getOrderKey());
+		} else {
+			log.error("melakukanPemesananSuratBerhargaNegara "+resultBilling.getErrorCode()+"  "+resultBilling.getMessage());
+			throw new MedallionException(resultBilling.getResponseCode()+" : "+resultBilling.getErrorCode()+" "+resultBilling.getMessage());
+		}
+
+		return result;
+	}
